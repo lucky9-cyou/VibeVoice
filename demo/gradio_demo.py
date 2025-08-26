@@ -32,11 +32,10 @@ logger = logging.get_logger(__name__)
 
 
 class VibeVoiceDemo:
-    def __init__(self, model_path: str, device: str = "cuda", inference_steps: int = 5):
+    def __init__(self, model_path: str, device: str = "cuda"):
         """Initialize the VibeVoice demo with model loading."""
         self.model_path = model_path
         self.device = device
-        self.inference_steps = inference_steps
         self.is_generating = False  # Track generation state
         self.stop_generation = False  # Flag to stop generation
         self.current_streamer = None  # Track current audio streamer
@@ -58,7 +57,6 @@ class VibeVoiceDemo:
             self.model_path,
             torch_dtype=torch.bfloat16,
             device_map='cuda',
-            attn_implementation="flash_attention_2",
         )
         self.model.eval()
         
@@ -68,7 +66,6 @@ class VibeVoiceDemo:
             algorithm_type='sde-dpmsolver++',
             beta_schedule='squaredcos_cap_v2'
         )
-        self.model.set_ddpm_inference_steps(num_steps=self.inference_steps)
         
         if hasattr(self.model.model, 'language_model'):
             print(f"Language model attention: {self.model.model.language_model.config._attn_implementation}")
@@ -130,10 +127,8 @@ class VibeVoiceDemo:
     def generate_podcast_streaming(self, 
                                  num_speakers: int,
                                  script: str,
-                                 speaker_1: str = None,
-                                 speaker_2: str = None,
-                                 speaker_3: str = None,
-                                 speaker_4: str = None,
+                                 speaker: str,
+                                 inference_steps: int = 5,
                                  cfg_scale: float = 1.3) -> Iterator[tuple]:
         try:
             
@@ -149,23 +144,11 @@ class VibeVoiceDemo:
             # Defend against common mistake
             script = script.replace("’", "'")
             
-            if num_speakers < 1 or num_speakers > 4:
-                self.is_generating = False
-                raise gr.Error("Error: Number of speakers must be between 1 and 4.")
-            
-            # Collect selected speakers
-            selected_speakers = [speaker_1, speaker_2, speaker_3, speaker_4][:num_speakers]
-            
-            # Validate speaker selections
-            for i, speaker in enumerate(selected_speakers):
-                if not speaker or speaker not in self.available_voices:
-                    self.is_generating = False
-                    raise gr.Error(f"Error: Please select a valid speaker for Speaker {i+1}.")
+            self.model.set_ddpm_inference_steps(num_steps=inference_steps)
             
             # Build initial log
             log = f"🎙️ Generating podcast with {num_speakers} speakers\n"
-            log += f"📊 Parameters: CFG Scale={cfg_scale}, Inference Steps={self.inference_steps}\n"
-            log += f"🎭 Speakers: {', '.join(selected_speakers)}\n"
+            log += f"📊 Parameters: CFG Scale={cfg_scale}, Inference Steps={inference_steps}\n"
             
             # Check for stop signal
             if self.stop_generation:
@@ -175,13 +158,8 @@ class VibeVoiceDemo:
             
             # Load voice samples
             voice_samples = []
-            for speaker_name in selected_speakers:
-                audio_path = self.available_voices[speaker_name]
-                audio_data = self.read_audio(audio_path)
-                if len(audio_data) == 0:
-                    self.is_generating = False
-                    raise gr.Error(f"Error: Failed to load audio for {speaker_name}")
-                voice_samples.append(audio_data)
+            audio_data = self.read_audio(speaker)
+            voice_samples = [audio_data]
             
             # log += f"✅ Loaded {len(voice_samples)} voice samples\n"
             
@@ -770,40 +748,29 @@ def create_demo_interface(demo_instance: VibeVoiceDemo):
             with gr.Column(scale=1, elem_classes="settings-card"):
                 gr.Markdown("### 🎛️ **Podcast Settings**")
                 
-                # Number of speakers
-                num_speakers = gr.Slider(
-                    minimum=1,
-                    maximum=4,
-                    value=2,
+                inference_steps = gr.Slider(
+                    minimum=10,
+                    maximum=50,
+                    value=10,
                     step=1,
-                    label="Number of Speakers",
-                    elem_classes="slider-container"
+                    label="Inference Steps",
+                    elem_classes="slider-container",
                 )
                 
                 # Speaker selection
-                gr.Markdown("### 🎭 **Speaker Selection**")
+                gr.Markdown("### 🎭 **Speaker Upload**")
                 
-                available_speaker_names = list(demo_instance.available_voices.keys())
-                # default_speakers = available_speaker_names[:4] if len(available_speaker_names) >= 4 else available_speaker_names
-                default_speakers = ['en-Alice_woman', 'en-Carter_man', 'en-Frank_man', 'en-Maya_woman']
-
-                speaker_selections = []
-                for i in range(4):
-                    default_value = default_speakers[i] if i < len(default_speakers) else None
-                    speaker = gr.Dropdown(
-                        choices=available_speaker_names,
-                        value=default_value,
-                        label=f"Speaker {i+1}",
-                        visible=(i < 2),  # Initially show only first 2 speakers
-                        elem_classes="speaker-item"
-                    )
-                    speaker_selections.append(speaker)
+                uploaded_speaker = gr.Audio(
+                    label="Upload Custom Speaker Audio (WAV/MP3/FLAC/Ogg/M4A/AAC)",
+                    type="filepath",
+                    elem_classes="speaker-item",
+                )
                 
                 # Advanced settings
                 gr.Markdown("### ⚙️ **Advanced Settings**")
                 
                 # Sampling parameters (contains all generation settings)
-                with gr.Accordion("Generation Parameters", open=False):
+                with gr.Accordion("Generation Parameters"):
                     cfg_scale = gr.Slider(
                         minimum=1.0,
                         maximum=2.0,
@@ -888,7 +855,7 @@ Or paste text directly and it will auto-assign speakers.""",
                     type="numpy",
                     elem_classes="audio-output",
                     streaming=True,  # Enable streaming mode
-                    autoplay=True,
+                    autoplay=False,
                     show_download_button=False,  # Explicitly show download button
                     visible=True
                 )
@@ -917,27 +884,12 @@ Or paste text directly and it will auto-assign speakers.""",
                     interactive=False,
                     elem_classes="log-output"
                 )
-        
-        def update_speaker_visibility(num_speakers):
-            updates = []
-            for i in range(4):
-                updates.append(gr.update(visible=(i < num_speakers)))
-            return updates
-        
-        num_speakers.change(
-            fn=update_speaker_visibility,
-            inputs=[num_speakers],
-            outputs=speaker_selections
-        )
+
         
         # Main generation function with streaming
-        def generate_podcast_wrapper(num_speakers, script, *speakers_and_params):
+        def generate_podcast_wrapper(script, speaker, inference_steps, cfg_scale):
             """Wrapper function to handle the streaming generation call."""
             try:
-                # Extract speakers and parameters
-                speakers = speakers_and_params[:4]  # First 4 are speaker selections
-                cfg_scale = speakers_and_params[4]   # CFG scale
-                
                 # Clear outputs and reset visibility at start
                 yield None, gr.update(value=None, visible=False), "🎙️ Starting generation...", gr.update(visible=True), gr.update(visible=False), gr.update(visible=True)
                 
@@ -945,12 +897,10 @@ Or paste text directly and it will auto-assign speakers.""",
                 final_log = "Starting generation..."
                 
                 for streaming_audio, complete_audio, log, streaming_visible in demo_instance.generate_podcast_streaming(
-                    num_speakers=int(num_speakers),
+                    num_speakers=1,
                     script=script,
-                    speaker_1=speakers[0],
-                    speaker_2=speakers[1],
-                    speaker_3=speakers[2],
-                    speaker_4=speakers[3],
+                    speaker=speaker,
+                    inference_steps=inference_steps,
                     cfg_scale=cfg_scale
                 ):
                     final_log = log
@@ -994,7 +944,7 @@ Or paste text directly and it will auto-assign speakers.""",
             queue=False
         ).then(
             fn=generate_podcast_wrapper,
-            inputs=[num_speakers, script_input] + speaker_selections + [cfg_scale],
+            inputs=[script_input, uploaded_speaker, inference_steps, cfg_scale],
             outputs=[audio_output, complete_audio_output, log_output, streaming_status, generate_btn, stop_btn],
             queue=True  # Enable Gradio's built-in queue
         )
@@ -1013,68 +963,6 @@ Or paste text directly and it will auto-assign speakers.""",
             queue=False
         )
         
-        # Function to randomly select an example
-        def load_random_example():
-            """Randomly select and load an example script."""
-            import random
-            
-            # Get available examples
-            if hasattr(demo_instance, 'example_scripts') and demo_instance.example_scripts:
-                example_scripts = demo_instance.example_scripts
-            else:
-                # Fallback to default
-                example_scripts = [
-                    [2, "Speaker 0: Welcome to our AI podcast demonstration!\nSpeaker 1: Thanks for having me. This is exciting!"]
-                ]
-            
-            # Randomly select one
-            if example_scripts:
-                selected = random.choice(example_scripts)
-                num_speakers_value = selected[0]
-                script_value = selected[1]
-                
-                # Return the values to update the UI
-                return num_speakers_value, script_value
-            
-            # Default values if no examples
-            return 2, ""
-        
-        # Connect random example button
-        random_example_btn.click(
-            fn=load_random_example,
-            inputs=[],
-            outputs=[num_speakers, script_input],
-            queue=False  # Don't queue this simple operation
-        )
-        
-        # Add usage tips
-        gr.Markdown("""
-        ### 💡 **Usage Tips**
-        
-        - Click **🚀 Generate Podcast** to start audio generation
-        - **Live Streaming** tab shows audio as it's generated (may have slight pauses)
-        - **Complete Audio** tab provides the full, uninterrupted podcast after generation
-        - During generation, you can click **🛑 Stop Generation** to interrupt the process
-        - The streaming indicator shows real-time generation progress
-        """)
-        
-        # Add example scripts
-        gr.Markdown("### 📚 **Example Scripts**")
-        
-        # Use dynamically loaded examples if available, otherwise provide a default
-        if hasattr(demo_instance, 'example_scripts') and demo_instance.example_scripts:
-            example_scripts = demo_instance.example_scripts
-        else:
-            # Fallback to a simple default example if no scripts loaded
-            example_scripts = [
-                [1, "Speaker 1: Welcome to our AI podcast demonstration! This is a sample script showing how VibeVoice can generate natural-sounding speech."]
-            ]
-        
-        gr.Examples(
-            examples=example_scripts,
-            inputs=[num_speakers, script_input],
-            label="Try these example scripts:"
-        )
 
     return interface
 
@@ -1143,7 +1031,6 @@ def main():
     demo_instance = VibeVoiceDemo(
         model_path=args.model_path,
         device=args.device,
-        inference_steps=args.inference_steps
     )
     
     # Create interface
